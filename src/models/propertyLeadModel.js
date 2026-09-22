@@ -417,8 +417,17 @@ const propertyLeadSchema = new mongoose.Schema(
       },
       finalPrice: Number,
       deposit: Number,
+      tenantId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User',
+      },
       tenantName: String,
       tenantPhone: String,
+      tenantEmail: {
+        type: String,
+        trim: true,
+        lowercase: true,
+      },
       tenantAadhaarLast4: String,
       leaseStartDate: Date,
       leaseDurationMonths: {

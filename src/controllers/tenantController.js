@@ -24,14 +24,18 @@ const findTenantProperty = async (user) => {
     queryOr.push({ 'deal.tenantEmail': { $regex: `^${userEmail}$`, $options: 'i' } });
   }
 
-  // Find lead where deal is closed or status is rented
+  // Find lead where deal is closed or status is rented matching this tenant
   const lead = await PropertyLead.findOne({
-    $or: queryOr.length > 0 ? queryOr : [{ _id: null }],
-    isDeleted: false,
-    $or: [
-      { 'deal.isClosed': true },
-      { status: 'rented' },
-      { status: 'verified' },
+    $and: [
+      { isDeleted: false },
+      { $or: queryOr.length > 0 ? queryOr : [{ _id: null }] },
+      {
+        $or: [
+          { "deal.isClosed": true },
+          { status: "rented" },
+          { status: "verified" },
+        ],
+      },
     ],
   }).sort({ updatedAt: -1 });
 

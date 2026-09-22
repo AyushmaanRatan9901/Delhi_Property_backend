@@ -108,6 +108,16 @@ router.patch(
   authorize('super_admin'),
   propertyController.confirmDeal
 );
+router.delete(
+  '/:id/deal',
+  authorize('super_admin'),
+  propertyController.removeTenantFromDeal
+);
+router.delete(
+  '/:id/deal/tenant',
+  authorize('super_admin'),
+  propertyController.removeTenantFromDeal
+);
 
 // Universal Rent Ledger
 router.get(

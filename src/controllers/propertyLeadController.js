@@ -1094,8 +1094,10 @@ const confirmDeal = async (req, res) => {
     dealType = "rent",
     finalPrice,
     deposit,
+    tenantId,
     tenantName,
     tenantPhone,
+    tenantEmail,
     tenantAadhaarLast4,
     leaseStartDate,
     leaseDurationMonths = 11,
@@ -1107,6 +1109,22 @@ const confirmDeal = async (req, res) => {
   const lead = await PropertyLead.findOne({ _id: id, isDeleted: false });
   if (!lead) throw new ApiError(404, "Property lead not found");
 
+  // Lookup registered tenant user if tenantId or phone is provided
+  const rawPhone = tenantPhone ? String(tenantPhone).replace(/\D/g, "") : "";
+  const cleanedPhone = rawPhone.length > 10 ? rawPhone.slice(-10) : rawPhone;
+
+  let tenantUser = null;
+  if (tenantId) {
+    tenantUser = await User.findById(tenantId);
+  } else if (cleanedPhone) {
+    tenantUser = await User.findOne({ phone: { $regex: cleanedPhone + "$" } });
+  }
+
+  const linkedTenantId = tenantUser?._id || (tenantId ? tenantId : undefined);
+  const linkedTenantName = tenantUser?.name || tenantName?.trim() || "Direct Tenant";
+  const linkedTenantPhone = tenantUser?.phone || cleanedPhone;
+  const linkedTenantEmail = tenantUser?.email || tenantEmail?.trim() || undefined;
+
   const price = Number(finalPrice) || lead.expectedPrice;
   const newStatus = dealType.toLowerCase() === "sale" ? "sold" : "rented";
 
@@ -1116,8 +1134,10 @@ const confirmDeal = async (req, res) => {
     dealType: dealType.toLowerCase(),
     finalPrice: price,
     deposit: Number(deposit) || lead.securityDeposit || 0,
-    tenantName: tenantName?.trim() || "Direct Tenant",
-    tenantPhone: tenantPhone ? String(tenantPhone).replace(/\D/g, "") : "",
+    tenantId: linkedTenantId,
+    tenantName: linkedTenantName,
+    tenantPhone: linkedTenantPhone,
+    tenantEmail: linkedTenantEmail,
     tenantAadhaarLast4: tenantAadhaarLast4
       ? String(tenantAadhaarLast4).slice(-4)
       : "",
@@ -1246,6 +1266,23 @@ const confirmDeal = async (req, res) => {
       emitToUser(agentRecipient.toString(), "lead:deal_closed", { lead, notification: notif });
     }
 
+    if (linkedTenantId) {
+      emitToUser(linkedTenantId.toString(), "tenant:property_assigned", { lead });
+      createAndSendNotification({
+        recipient: linkedTenantId,
+        recipientRole: "tenant",
+        sender: req.user._id,
+        senderName: req.user.name,
+        title: "Property Allocated & Deal Confirmed! 🏠",
+        message: `Your tenancy agreement for "${lead.title || lead.locality || "Property"}" is now active. Rent details & records are ready in your dashboard.`,
+        type: "rent_due",
+        priority: "high",
+        leadId: lead._id,
+        propertyId: lead.propertyId || lead.leadId,
+        data: { lead },
+      }).catch((e) => console.error("Tenant notif error:", e));
+    }
+
     emitToRole("super_admin", "lead:deal_closed", { lead });
     emitToRole("admin", "lead:deal_closed", { lead });
   } catch (socketErr) {
@@ -1258,6 +1295,76 @@ const confirmDeal = async (req, res) => {
       lead,
       `Deal successfully finalized and marked as '${newStatus.toUpperCase()}'!`,
     ),
+  );
+};
+
+/**
+ * DELETE /api/v1/leads/:id/deal/tenant (or DELETE /api/v1/leads/:id/deal)
+ * @desc SUPER ADMIN: Remove tenant from closed deal, vacate unit and reopen property to verified status
+ */
+const removeTenantFromDeal = async (req, res) => {
+  const { id } = req.params;
+  const lead = await PropertyLead.findOne({ _id: id, isDeleted: false });
+  if (!lead) throw new ApiError(404, "Property lead not found");
+
+  const formerTenantId = lead.deal?.tenantId;
+  const formerTenantName = lead.deal?.tenantName;
+
+  // Reset deal and status
+  lead.status = "verified";
+  lead.deal = {
+    isClosed: false,
+    dealType: "rent",
+    finalPrice: undefined,
+    deposit: undefined,
+    tenantId: undefined,
+    tenantName: undefined,
+    tenantPhone: undefined,
+    tenantEmail: undefined,
+    tenantAadhaarLast4: undefined,
+    agreementNumber: undefined,
+    agreementGenerated: false,
+    policeVerificationStatus: "pending",
+    closedAt: undefined,
+    closedBy: undefined,
+    notes: `Tenant '${formerTenantName || "Resident"}' was removed and property vacated by Super Admin on ${new Date().toLocaleDateString()}`,
+  };
+
+  await lead.save();
+
+  // Notify former tenant via socket & notification
+  if (formerTenantId) {
+    try {
+      emitToUser(formerTenantId.toString(), "tenant:property_removed", {
+        propertyId: lead._id,
+        title: lead.title,
+      });
+      createAndSendNotification({
+        recipient: formerTenantId,
+        recipientRole: "tenant",
+        sender: req.user._id,
+        senderName: req.user.name,
+        title: "Tenancy Record Updated",
+        message: `Your tenancy allocation for "${lead.title || lead.locality || "Property"}" has been terminated and the unit vacated.`,
+        type: "announcement",
+        priority: "medium",
+        leadId: lead._id,
+      }).catch(() => {});
+    } catch (e) {
+      console.error("Socket error on tenant removal:", e);
+    }
+  }
+
+  emitToRole("super_admin", "lead:deal_closed", { lead });
+  emitToRole("admin", "lead:deal_closed", { lead });
+  broadcast("lead:updated", lead);
+
+  return res.json(
+    new ApiResponse(
+      200,
+      lead,
+      "Tenant successfully removed. Property is now vacant and restored to 'VERIFIED' status."
+    )
   );
 };
 
@@ -2209,6 +2316,7 @@ module.exports = {
   getDuplicateLeads,
   resolveDuplicateLead,
   confirmDeal,
+  removeTenantFromDeal,
   getAdminRentLedger,
   updateRentLedgerEntry,
   getAdminPayouts,
