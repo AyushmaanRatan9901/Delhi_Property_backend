@@ -12,6 +12,7 @@ const notificationRoutes = require('./routes/notificationRoutes');
 const tenantRoutes = require('./routes/tenantRoutes');
 const rentPaymentRoutes = require('./routes/rentPaymentRoutes');
 const notificationAutomationRoutes = require('./routes/notificationAutomationRoutes');
+const crmRoutes = require('./routes/crm');
 
 const app = express();
 
@@ -34,8 +35,10 @@ app.use('/api/v1/notifications', notificationRoutes);
 app.use('/api/v1/tenant', tenantRoutes);
 app.use('/api/v1/rent-payments', rentPaymentRoutes);
 app.use('/api/v1/notification-automations', notificationAutomationRoutes);
+app.use('/api/v1/crm', crmRoutes);
 
 // Direct Aliases
+app.use('/api/crm', crmRoutes);
 app.use('/api/superadmin/tenant-history', rentPaymentRoutes);
 app.use('/api/rent-payments', rentPaymentRoutes);
 app.use('/api/notifications', notificationRoutes);
