@@ -14,6 +14,7 @@ const {
   updateKycStatus,
   createUser,
   listUsers,
+  getTenantsDirectory,
   getUserById,
   editUser,
   toggleUserStatus,
@@ -139,7 +140,7 @@ router.post(
     body('phone').matches(/^[6-9]\d{9}$/).withMessage('Valid 10-digit Indian mobile number required'),
     body('email').optional().isEmail().withMessage('Invalid email format'),
     body('role')
-      .isIn(['admin', 'field_agent', 'dealer', 'broker', 'field_staff', 'tele_caller'])
+      .isIn(['admin', 'field_agent', 'dealer', 'broker', 'field_staff', 'tele_caller', 'owner', 'tenant'])
       .withMessage('Role must be admin, field_agent, dealer, broker, field_staff, or tele_caller'),
     body('commissionRate').optional().isFloat({ min: 0, max: 100 }).withMessage('Commission rate must be between 0 and 100'),
   ],
@@ -147,6 +148,7 @@ router.post(
   createUser
 );
 
+router.get('/tenants', protect, authorize('super_admin', 'admin'), getTenantsDirectory);
 router.get('/users', protect, authorize('super_admin', 'admin'), listUsers);
 
 router.get('/users/:id', protect, authorize('super_admin', 'admin'), getUserById);

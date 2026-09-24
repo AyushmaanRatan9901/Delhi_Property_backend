@@ -58,6 +58,16 @@ router.post(
   authorize('field_staff', 'verification_staff', 'admin', 'super_admin'),
   propertyController.addInspectionReport
 );
+router.post(
+  '/:id/inspections/schedule',
+  authorize('field_staff', 'verification_staff', 'admin', 'super_admin'),
+  propertyController.schedulePropertyInspection
+);
+router.patch(
+  '/:propertyId/room-change/:requestId',
+  authorize('field_staff', 'verification_staff', 'admin', 'super_admin'),
+  propertyController.updateRoomChangeRequestStatus
+);
 
 // ── 3. Field Staff Routes (Assigned Leads & Physical Inspection) ───────────────
 router.get(

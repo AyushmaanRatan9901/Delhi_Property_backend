@@ -367,6 +367,88 @@ const createUser = async (req, res, next) => {
   res.status(201).json(new ApiResponse(201, userObj, 'User account created. They can now login with OTP.'));
 };
 
+// GET /api/v1/auth/tenants
+// Returns all real registered tenants from User collection and PropertyLead deals
+const getTenantsDirectory = async (req, res) => {
+  try {
+    // 1. Fetch all users with role: 'tenant'
+    const dbTenants = await User.find({ role: 'tenant' })
+      .select('-otp')
+      .sort('-createdAt')
+      .lean();
+
+    const tenantMap = new Map();
+
+    dbTenants.forEach((u) => {
+      if (u.phone) {
+        tenantMap.set(u.phone, {
+          _id: String(u._id),
+          name: u.name,
+          phone: u.phone,
+          email: u.email || '',
+          profilePhoto: u.profilePhoto || '',
+          role: u.role || 'tenant',
+          createdAt: u.createdAt,
+          source: 'user_account',
+        });
+      }
+    });
+
+    // 2. Also harvest any tenants from PropertyLeads who have an active or past deal
+    const leadsWithTenants = await PropertyLead.find({
+      $or: [
+        { 'deal.tenantPhone': { $exists: true, $ne: '' } },
+        { 'deal.tenantName': { $exists: true, $ne: '' } },
+      ],
+    })
+      .select('title locality propertyType deal tenancyHistory')
+      .lean();
+
+    for (const lead of leadsWithTenants) {
+      const deal = lead.deal || {};
+      const phone = deal.tenantPhone ? String(deal.tenantPhone).replace(/\D/g, '').slice(-10) : '';
+      if (phone && !tenantMap.has(phone)) {
+        let userDoc = await User.findOne({ phone });
+        if (!userDoc) {
+          try {
+            userDoc = await User.create({
+              name: deal.tenantName || 'Tenant',
+              phone,
+              email: deal.tenantEmail || undefined,
+              role: 'tenant',
+              isActive: true,
+              isVerified: true,
+            });
+          } catch (e) {}
+        }
+
+        tenantMap.set(phone, {
+          _id: userDoc ? String(userDoc._id) : 'tnt-' + phone,
+          name: deal.tenantName || (userDoc ? userDoc.name : 'Tenant'),
+          phone,
+          email: deal.tenantEmail || (userDoc ? userDoc.email : ''),
+          role: 'tenant',
+          profilePhoto: userDoc ? userDoc.profilePhoto : '',
+          activeProperty: lead.title || lead.locality || '',
+          source: 'property_deal',
+        });
+      }
+    }
+
+    const tenantList = Array.from(tenantMap.values());
+
+    res.json(
+      new ApiResponse(200, {
+        tenants: tenantList,
+        users: tenantList,
+        total: tenantList.length,
+      }, 'Real tenant directory fetched successfully')
+    );
+  } catch (err) {
+    res.status(500).json(new ApiResponse(500, null, err.message));
+  }
+};
+
 // GET /api/v1/auth/users
 const listUsers = async (req, res) => {
   const { role, isActive, page = 1, limit = 20 } = req.query;
@@ -753,23 +835,68 @@ const getUserAnalyticsAndDetail = async (req, res, next) => {
       }));
 
     } else if (userRole === 'tenant') {
-      // 5. Tenant
+      // 5. Tenant Detailed Dossier
+      const userPhoneClean = userPhone ? String(userPhone).replace(/\D/g, '').slice(-10) : '';
+      const userEmailClean = userEmail ? String(userEmail).trim().toLowerCase() : '';
+
+      const queryOr = [
+        { 'deal.tenantId': userId },
+      ];
+      if (userPhoneClean) {
+        queryOr.push({ 'deal.tenantPhone': { $regex: userPhoneClean + '$', $options: 'i' } });
+        queryOr.push({ 'deal.tenantPhone': userPhone });
+      }
+      if (userEmailClean) {
+        queryOr.push({ 'deal.tenantEmail': { $regex: `^${userEmailClean}$`, $options: 'i' } });
+      }
+
       const tenantQuery = {
-        $or: [
-          { 'deal.tenantPhone': userPhone },
-          ...(userEmail ? [{ 'deal.tenantEmail': userEmail }] : []),
-        ],
+        $or: queryOr,
         isDeleted: false,
       };
 
-      const leads = await PropertyLead.find(tenantQuery).lean();
+      const leads = await PropertyLead.find(tenantQuery).sort('-updatedAt -createdAt').lean();
+
+      // Find active primary assigned property
+      const activeProperty = leads.find((l) => l.deal?.isClosed === true || l.status === 'rented' || l.status === 'verified') || leads[0] || null;
+
       const allRentLedger = [];
+      const allComplaints = [];
+      const allInspections = [];
+      const allRoomChanges = [];
+
+      let totalRentPaid = 0;
+      let totalRentDue = 0;
+      let isSecurityDepositPaid = false;
+      let securityDepositAmount = 0;
+
       leads.forEach((l) => {
+        const propDeposit = l.deal?.deposit || l.securityDeposit || (l.deal?.finalPrice ? l.deal.finalPrice * 2 : 0);
+        if (propDeposit > securityDepositAmount) {
+          securityDepositAmount = propDeposit;
+        }
+
+        if (l.deal?.isDepositPaid === true || l.deal?.depositPaid === true || l.isSecurityDepositPaid === true) {
+          isSecurityDepositPaid = true;
+        }
+
+        // 1. Rent Ledger
         if (Array.isArray(l.rentLedger)) {
           l.rentLedger.forEach((r) => {
+            if (r.status === 'PAID') {
+              totalRentPaid += Number(r.amount) || 0;
+            } else if (['PENDING', 'OVERDUE'].includes(r.status)) {
+              totalRentDue += Number(r.amount) || 0;
+            }
+            if ((r.month === 'Security Deposit' || r.type === 'deposit') && r.status === 'PAID') {
+              isSecurityDepositPaid = true;
+            }
+
             allRentLedger.push({
+              _id: r._id,
               leadId: l.leadId,
-              propertyTitle: l.title,
+              propertyId: l._id,
+              propertyTitle: l.title || `${l.propertyType} in ${l.locality}`,
               month: r.month,
               amount: r.amount,
               dueDate: r.dueDate,
@@ -777,17 +904,111 @@ const getUserAnalyticsAndDetail = async (req, res, next) => {
               status: r.status,
               paymentMode: r.paymentMode,
               utrNumber: r.utrNumber,
+              disputeNote: r.disputeNote,
+              resolved: r.resolved,
+            });
+          });
+        }
+
+        // 2. Complaints
+        if (Array.isArray(l.complaints)) {
+          l.complaints.forEach((c) => {
+            allComplaints.push({
+              ...c,
+              propertyId: l._id,
+              leadTrackingId: l.leadId,
+              propertyTitle: l.title || `${l.propertyType} in ${l.locality}`,
+              locality: l.locality,
+            });
+          });
+        }
+
+        // 3. Inspections
+        if (Array.isArray(l.scheduledInspections)) {
+          l.scheduledInspections.forEach((insp) => {
+            allInspections.push({
+              ...insp,
+              propertyId: l._id,
+              leadTrackingId: l.leadId,
+              propertyTitle: l.title || `${l.propertyType} in ${l.locality}`,
+              locality: l.locality,
+            });
+          });
+        }
+
+        // 4. Room Change Requests
+        if (Array.isArray(l.roomChangeRequests)) {
+          l.roomChangeRequests.forEach((rc) => {
+            allRoomChanges.push({
+              ...rc,
+              propertyId: l._id,
+              leadTrackingId: l.leadId,
+              propertyTitle: l.title || `${l.propertyType} in ${l.locality}`,
+              locality: l.locality,
             });
           });
         }
       });
 
+      // Sort lists chronologically
+      allRentLedger.sort((a, b) => new Date(b.dueDate || b.paidDate || 0) - new Date(a.dueDate || a.paidDate || 0));
+      allComplaints.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+      allInspections.sort((a, b) => new Date(b.scheduledDate || 0) - new Date(a.scheduledDate || 0));
+      allRoomChanges.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+
+      // Calculate Current Rent Due Status
+      let currentRentStatus = 'NO_ACTIVE_RENT';
+      let currentRentAmount = 0;
+      let nextDueDate = null;
+      let daysRemaining = null;
+
+      if (activeProperty) {
+        const currentDate = new Date();
+        const currentMonthStr = currentDate.toLocaleString('en-US', { month: 'short', year: 'numeric' });
+
+        const currentEntry = (activeProperty.rentLedger || []).find((r) => r.month === currentMonthStr)
+          || (activeProperty.rentLedger || []).find((r) => r.status === 'PENDING' || r.status === 'OVERDUE')
+          || (activeProperty.rentLedger || [])[activeProperty.rentLedger.length - 1];
+
+        if (currentEntry) {
+          currentRentStatus = currentEntry.status || 'PENDING';
+          currentRentAmount = currentEntry.amount || activeProperty.deal?.finalPrice || activeProperty.expectedPrice || 0;
+          nextDueDate = currentEntry.dueDate || new Date(currentDate.getFullYear(), currentDate.getMonth(), 5);
+          if (nextDueDate) {
+            daysRemaining = Math.ceil((new Date(nextDueDate).getTime() - currentDate.getTime()) / (1000 * 60 * 60 * 24));
+          }
+        } else {
+          currentRentStatus = 'PENDING';
+          currentRentAmount = activeProperty.deal?.finalPrice || activeProperty.expectedPrice || 0;
+          nextDueDate = new Date(currentDate.getFullYear(), currentDate.getMonth(), 5);
+          daysRemaining = Math.ceil((new Date(nextDueDate).getTime() - currentDate.getTime()) / (1000 * 60 * 60 * 24));
+        }
+      }
+
       roleData.metrics = {
         rentedPropertiesCount: leads.length,
-        activeAgreements: leads.filter((l) => l.deal?.status === 'closed_won' || l.status === 'rented').length,
+        activeAgreements: leads.filter((l) => l.deal?.status === 'closed_won' || l.status === 'rented' || l.deal?.isClosed).length,
+        totalRentPaid,
+        totalRentDue,
+        currentRentStatus,
+        currentRentAmount,
+        daysRemaining,
+        nextDueDate,
+        securityDepositAmount,
+        isSecurityDepositPaid,
+        activeComplaintsCount: allComplaints.filter((c) => ['submitted', 'open', 'assigned', 'in_progress', 'reopened'].includes(c.status)).length,
+        resolvedComplaintsCount: allComplaints.filter((c) => ['resolved', 'closed'].includes(c.status)).length,
+        totalInspectionsCount: allInspections.length,
+        pendingInspectionsCount: allInspections.filter((i) => i.status === 'scheduled' || i.status === 'overdue').length,
+        roomChangeRequestsCount: allRoomChanges.length,
       };
+
+      roleData.assignedProperty = activeProperty;
       roleData.properties = leads;
       roleData.rentLedger = allRentLedger;
+      roleData.complaints = allComplaints;
+      roleData.inspections = allInspections;
+      roleData.roomChangeRequests = allRoomChanges;
     }
   } catch (err) {
     console.error('[getUserAnalyticsAndDetail error]', err);
@@ -802,6 +1023,7 @@ const getUserAnalyticsAndDetail = async (req, res, next) => {
 };
 
 module.exports = {
+  getTenantsDirectory,
   getUserAnalyticsAndDetail,
   registerFieldAgent,
   verifyRegistrationOTP,

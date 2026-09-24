@@ -1,6 +1,7 @@
 const PropertyLead = require('../models/propertyLeadModel');
 const Notification = require('../models/Notification');
 const User = require('../models/User');
+const RentPayment = require('../models/RentPayment');
 const ApiError = require('../utils/ApiError');
 const ApiResponse = require('../utils/ApiResponse');
 const { createAndSendNotification } = require('./notificationController');
@@ -69,6 +70,8 @@ const sanitizePropertyForTenant = (lead) => {
     },
     rentAmount: lead.deal?.finalPrice || lead.expectedPrice || 15000,
     securityDeposit: lead.deal?.deposit || lead.securityDeposit || (lead.deal?.finalPrice ? lead.deal.finalPrice * 2 : 30000),
+    isSecurityDepositPaid: lead.deal?.isDepositPaid === true || lead.deal?.depositPaid === true || lead.isSecurityDepositPaid === true,
+    securityDepositStatus: (lead.deal?.isDepositPaid === true || lead.deal?.depositPaid === true || lead.isSecurityDepositPaid === true) ? 'PAID' : 'PENDING',
     carpetAreaSqFt: lead.inspectionDetails?.actualCarpetAreaSqFt || lead.carpetArea || 850,
     bedrooms: lead.inspectionDetails?.actualBedrooms || lead.bedrooms || 2,
     bathrooms: lead.inspectionDetails?.actualBathrooms || lead.bathrooms || 2,
@@ -408,6 +411,7 @@ const payTenantRent = async (req, res) => {
   const currentMonthStr = month || new Date().toLocaleString('en-US', { month: 'short', year: 'numeric' });
   const rentAmount = Number(amount) || lead.deal?.finalPrice || lead.expectedPrice || 15000;
   const utr = utrNumber ? String(utrNumber).trim().toUpperCase() : `TXN-${Date.now().toString().slice(-8)}`;
+  const receiptId = `RCP-${Date.now().toString().slice(-6)}`;
 
   if (!lead.rentLedger) lead.rentLedger = [];
 
@@ -431,7 +435,95 @@ const payTenantRent = async (req, res) => {
     });
   }
 
+  // If this payment is for the Security Deposit, record it in deal and lead
+  if (req.body?.isDepositPayment || req.body?.type === 'deposit' || month === 'Security Deposit' || req.body?.isSecurityDeposit) {
+    if (lead.deal) {
+      lead.deal.isDepositPaid = true;
+      lead.deal.depositPaidAt = new Date();
+      lead.deal.depositPaymentMode = paymentMode;
+      lead.deal.depositUtrNumber = utr;
+    }
+    lead.isSecurityDepositPaid = true;
+  }
+
+  // 1. Calculate & Credit Field Agent Recurring Commission (Permanent, Immutable Record)
+  const agentId = lead.agent || lead.createdBy;
+  const recurringRate = lead.commission?.recurringMonthlyRate || 5;
+  const commissionAmt = lead.commission?.recurringMonthlyCommission > 0
+    ? lead.commission.recurringMonthlyCommission
+    : Math.round(rentAmount * (recurringRate / 100));
+
+  if (agentId && commissionAmt > 0) {
+    if (!lead.commission) lead.commission = {};
+    if (!Array.isArray(lead.commission.recurringCommissions)) {
+      lead.commission.recurringCommissions = [];
+    }
+    const existingComm = lead.commission.recurringCommissions.find(c => c.month === currentMonthStr && c.type === 'recurring');
+    if (!existingComm) {
+      lead.commission.recurringCommissions.push({
+        month: currentMonthStr,
+        rentAmount: rentAmount,
+        commissionAmount: commissionAmt,
+        type: 'recurring',
+        status: 'approved',
+        paidAt: new Date(),
+        utrNumber: utr,
+        createdAt: new Date(),
+      });
+      await User.findByIdAndUpdate(agentId, {
+        $inc: { 'commissionWallet.balance': commissionAmt },
+      }).catch(e => console.error('Agent wallet credit error in payTenantRent:', e));
+    }
+  }
+
+  // 2. Record Owner Rent Payout Ledger
+  if (!Array.isArray(lead.ownerPayouts)) {
+    lead.ownerPayouts = [];
+  }
+  const existingOwnerPayout = lead.ownerPayouts.find(p => p.month === currentMonthStr);
+  const ownerPayoutAmt = Math.round(rentAmount * 0.95);
+  if (!existingOwnerPayout) {
+    lead.ownerPayouts.push({
+      amount: ownerPayoutAmt,
+      month: currentMonthStr,
+      dueDate: new Date(),
+      payoutDate: new Date(),
+      status: 'approved',
+      paymentMode: paymentMode || 'UPI',
+      remarks: `Rent collected for ${currentMonthStr} - credited to owner account`,
+      approvedBy: req.user._id,
+      approvedAt: new Date(),
+    });
+  }
+
   await lead.save();
+
+  // 3. Upsert standalone RentPayment document (Permanent Ledger)
+  try {
+    await RentPayment.findOneAndUpdate(
+      { tenantId: req.user._id, propertyId: lead._id, month: currentMonthStr },
+      {
+        tenantId: req.user._id,
+        propertyId: lead._id,
+        month: currentMonthStr,
+        year: new Date().getFullYear(),
+        amount: rentAmount,
+        paidAmount: rentAmount,
+        dueDate: existingEntry?.dueDate || new Date(),
+        paidDate: new Date(),
+        status: 'paid',
+        paymentMethod: (paymentMode || 'upi').toLowerCase(),
+        transactionId: utr,
+        utrNumber: utr,
+        receiptId: receiptId,
+        notes: 'Tenant direct rent settlement',
+        createdBy: req.user._id,
+      },
+      { upsert: true, new: true }
+    );
+  } catch (rpErr) {
+    console.error('RentPayment upsert error in payTenantRent:', rpErr);
+  }
 
   // Create real-time notification for Super Admin & Staff
   try {
@@ -450,8 +542,6 @@ const payTenantRent = async (req, res) => {
   } catch (err) {
     console.log('[payTenantRent notification error]', err);
   }
-
-  const receiptId = `RCP-${Date.now().toString().slice(-6)}`;
 
   return res.json(
     new ApiResponse(200, {
@@ -883,20 +973,27 @@ const markAllTenantNotificationsRead = async (req, res) => {
 const getTenantProfile = async (req, res) => {
   const lead = await findTenantProperty(req.user);
 
+  const aadhaarNumber = req.user.kyc?.aadhaarNumber || req.user.aadhaarNumber || (lead?.deal?.tenantAadhaarLast4 ? `XXXX-XXXX-${lead.deal.tenantAadhaarLast4}` : '');
+  const aadhaarDoc = req.user.kyc?.aadhaarDoc || req.user.aadhaarDoc || req.user.aadhaarCard || '';
+  const aadhaarStatus = req.user.kyc?.status || (aadhaarDoc || aadhaarNumber ? 'SUBMITTED' : 'NOT_UPLOADED');
+
   const profile = {
     id: req.user._id,
     tenantId: `TNT-${String(req.user._id).slice(-6).toUpperCase()}`,
     name: req.user.name,
-    phone: req.user.phone,
-    email: req.user.email,
+    phone: req.user.phone, // IMMUTABLE
+    email: req.user.email, // IMMUTABLE
     profilePhoto: req.user.profilePhoto || req.user.avatar,
-    occupation: req.user.occupation || 'Working Professional',
+    occupation: req.user.occupation || '',
     emergencyContact: req.user.emergencyContact || {
-      name: 'Primary Contact',
-      phone: '+91 98765 43210',
-      relation: 'Family',
+      name: '',
+      phone: '',
+      relation: '',
     },
-    permanentAddress: req.user.permanentAddress || 'New Delhi, India',
+    permanentAddress: req.user.permanentAddress || '',
+    aadhaarNumber,
+    aadhaarDoc,
+    aadhaarStatus,
     assignedPropertyId: lead ? (lead.propertyId || lead.leadId) : null,
     assignedPropertyTitle: lead ? lead.title : null,
     leaseStartDate: lead?.deal?.leaseStartDate || req.user.createdAt,
@@ -909,30 +1006,96 @@ const getTenantProfile = async (req, res) => {
 
 /**
  * 19. PATCH /api/v1/tenant/profile
- * @desc Update Editable Tenant Profile Info
+ * @desc Update Editable Tenant Profile Info (Email and Phone are strictly IMMUTABLE)
  */
 const updateTenantProfile = async (req, res) => {
-  const { name, email, emergencyContact, occupation, permanentAddress, profilePhoto } = req.body;
+  const { name, emergencyContact, occupation, permanentAddress, profilePhoto, aadhaarNumber, aadhaarDoc } = req.body;
 
   const user = await User.findById(req.user._id);
   if (!user) throw new ApiError(404, 'User not found');
 
+  // Strict enforcement: Email and Phone cannot be changed by tenant
+  if (req.body.email && req.body.email.trim().toLowerCase() !== (user.email || '').toLowerCase()) {
+    throw new ApiError(400, 'Email address is locked and cannot be changed. Please contact Super Admin for official account email updates.');
+  }
+  if (req.body.phone && String(req.body.phone).replace(/\D/g, '').slice(-10) !== String(user.phone).replace(/\D/g, '').slice(-10)) {
+    throw new ApiError(400, 'Phone number is locked and cannot be changed. Registered mobile number is tied to your active tenancy agreement.');
+  }
+
   if (name) user.name = name.trim();
-  if (email) user.email = email.trim().toLowerCase();
-  if (occupation) user.occupation = occupation.trim();
-  if (permanentAddress) user.permanentAddress = permanentAddress.trim();
+  if (occupation !== undefined) user.occupation = occupation.trim();
+  if (permanentAddress !== undefined) user.permanentAddress = permanentAddress.trim();
   if (profilePhoto) user.profilePhoto = profilePhoto;
+
+  if (aadhaarNumber) {
+    user.aadhaarNumber = aadhaarNumber.trim();
+    if (!user.kyc) user.kyc = {};
+    user.kyc.aadhaarNumber = aadhaarNumber.trim();
+    if (user.kyc.status === 'NOT_UPLOADED') user.kyc.status = 'UNDER_REVIEW';
+  }
+
+  if (aadhaarDoc) {
+    user.aadhaarDoc = aadhaarDoc;
+    user.aadhaarCard = aadhaarDoc;
+    if (!user.kyc) user.kyc = {};
+    user.kyc.aadhaarDoc = aadhaarDoc;
+    user.kyc.status = 'UNDER_REVIEW';
+  }
+
   if (emergencyContact) {
     user.emergencyContact = {
-      name: emergencyContact.name || user.emergencyContact?.name,
-      phone: emergencyContact.phone || user.emergencyContact?.phone,
-      relation: emergencyContact.relation || user.emergencyContact?.relation,
+      name: emergencyContact.name !== undefined ? emergencyContact.name.trim() : user.emergencyContact?.name,
+      phone: emergencyContact.phone !== undefined ? emergencyContact.phone.trim() : user.emergencyContact?.phone,
+      relation: emergencyContact.relation !== undefined ? emergencyContact.relation.trim() : user.emergencyContact?.relation,
     };
   }
 
   await user.save();
 
   return res.json(new ApiResponse(200, { message: 'Profile updated successfully', user }));
+};
+
+/**
+ * 20. POST /api/v1/tenant/aadhaar
+ * @desc Upload Aadhaar Card Document / KYC for Tenant
+ */
+const uploadTenantAadhaar = async (req, res) => {
+  const user = await User.findById(req.user._id);
+  if (!user) throw new ApiError(404, 'User not found');
+
+  let fileUrl = '';
+  if (req.file) {
+    fileUrl = `/uploads/kyc/${req.file.filename}`;
+  } else if (req.body.documentUrl || req.body.aadhaarDoc) {
+    fileUrl = req.body.documentUrl || req.body.aadhaarDoc;
+  }
+
+  const { aadhaarNumber } = req.body;
+
+  if (aadhaarNumber) {
+    user.aadhaarNumber = aadhaarNumber.trim();
+  }
+
+  if (fileUrl) {
+    user.aadhaarDoc = fileUrl;
+    user.aadhaarCard = fileUrl;
+    if (!user.kyc) user.kyc = {};
+    user.kyc.aadhaarDoc = fileUrl;
+    if (aadhaarNumber) user.kyc.aadhaarNumber = aadhaarNumber.trim();
+    user.kyc.status = 'UNDER_REVIEW';
+    user.kyc.submittedAt = new Date();
+  }
+
+  await user.save();
+
+  return res.json(
+    new ApiResponse(200, {
+      message: 'Aadhaar card uploaded successfully. Record submitted for verification.',
+      aadhaarDoc: fileUrl || user.aadhaarDoc,
+      aadhaarNumber: user.aadhaarNumber,
+      status: user.kyc?.status || 'UNDER_REVIEW',
+    })
+  );
 };
 
 module.exports = {
@@ -955,4 +1118,5 @@ module.exports = {
   markAllTenantNotificationsRead,
   getTenantProfile,
   updateTenantProfile,
+  uploadTenantAadhaar,
 };

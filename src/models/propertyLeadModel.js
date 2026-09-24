@@ -455,6 +455,35 @@ const propertyLeadSchema = new mongoose.Schema(
       notes: String,
     },
 
+    // ── Tenancy & Lease History (Permanent Immutable Archive) ────
+    tenancyHistory: [
+      {
+        tenantId: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: 'User',
+        },
+        tenantName: String,
+        tenantPhone: String,
+        tenantEmail: String,
+        tenantAadhaarLast4: String,
+        dealType: String,
+        finalPrice: Number,
+        deposit: Number,
+        leaseStartDate: Date,
+        leaseEndDate: Date,
+        agreementNumber: String,
+        vacatedAt: {
+          type: Date,
+          default: Date.now,
+        },
+        vacatedBy: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: 'User',
+        },
+        vacatedReason: String,
+      },
+    ],
+
     // ── Owner Rent Payouts (SUPER ADMIN APPROVAL) ───────────────
     ownerPayouts: [
       {

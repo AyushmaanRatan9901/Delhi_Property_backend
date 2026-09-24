@@ -2,6 +2,7 @@ const PropertyLead = require("../models/propertyLeadModel");
 const User = require("../models/User");
 const AdminSetting = require("../models/AdminSetting");
 const Notification = require("../models/Notification");
+const RentPayment = require("../models/RentPayment");
 const { createAndSendNotification } = require("./notificationController");
 const ApiError = require("../utils/ApiError");
 const ApiResponse = require("../utils/ApiResponse");
@@ -321,7 +322,11 @@ const getMyLeadStats = async (req, res) => {
     }),
     PropertyLead.countDocuments({
       agent: agentId,
-      status: { $in: ["rented", "sold"] },
+      $or: [
+        { status: { $in: ["rented", "sold"] } },
+        { "deal.isClosed": true },
+        { "tenancyHistory.0": { $exists: true } },
+      ],
       isDeleted: false,
     }),
     PropertyLead.countDocuments({
@@ -342,7 +347,12 @@ const getMyLeadStats = async (req, res) => {
           potentialCommission: {
             $sum: {
               $cond: [
-                { $in: ["$status", ["new", "assigned", "under_verification", "verified"]] },
+                {
+                  $and: [
+                    { $in: ["$status", ["new", "assigned", "under_verification", "verified"]] },
+                    { $nin: ["$commission.status", ["approved", "paid"]] },
+                  ],
+                },
                 { $ifNull: ["$commission.firstMonthCommission", "$commission.estimatedAmount"] },
                 0,
               ],
@@ -351,13 +361,8 @@ const getMyLeadStats = async (req, res) => {
           approvedCommission: {
             $sum: {
               $cond: [
-                {
-                  $and: [
-                    { $in: ["$status", ["rented", "sold"]] },
-                    { $in: ["$commission.status", ["approved", "paid"]] },
-                  ],
-                },
-                { $ifNull: ["$commission.approvedAmount", 0] },
+                { $in: ["$commission.status", ["approved", "paid"]] },
+                { $ifNull: ["$commission.approvedAmount", "$commission.firstMonthCommission"] },
                 0,
               ],
             },
@@ -374,13 +379,8 @@ const getMyLeadStats = async (req, res) => {
           paidCommission: {
             $sum: {
               $cond: [
-                {
-                  $and: [
-                    { $in: ["$status", ["rented", "sold"]] },
-                    { $eq: ["$commission.status", "paid"] },
-                  ],
-                },
-                { $ifNull: ["$commission.approvedAmount", 0] },
+                { $eq: ["$commission.status", "paid"] },
+                { $ifNull: ["$commission.approvedAmount", "$commission.firstMonthCommission"] },
                 0,
               ],
             },
@@ -388,6 +388,7 @@ const getMyLeadStats = async (req, res) => {
         },
       },
     ]),
+    User.findById(agentId).select("commissionWallet"),
   ]);
 
   const comm = commissionSummary[0] || {
@@ -396,6 +397,11 @@ const getMyLeadStats = async (req, res) => {
     recurringMonthlyActive: 0,
     paidCommission: 0,
   };
+
+  const actualWalletBalance =
+    agentUser?.commissionWallet?.balance !== undefined && agentUser?.commissionWallet?.balance !== null
+      ? agentUser.commissionWallet.balance
+      : Math.max(0, comm.approvedCommission - comm.paidCommission);
 
   return res.json(
     new ApiResponse(
@@ -411,7 +417,7 @@ const getMyLeadStats = async (req, res) => {
         approvedCommission: comm.approvedCommission,
         recurringMonthlyActive: comm.recurringMonthlyActive,
         paidCommission: comm.paidCommission,
-        walletBalance: Math.max(0, comm.approvedCommission - comm.paidCommission),
+        walletBalance: actualWalletBalance,
       },
       "Agent lead stats retrieved successfully",
     ),
@@ -1114,16 +1120,76 @@ const confirmDeal = async (req, res) => {
   const cleanedPhone = rawPhone.length > 10 ? rawPhone.slice(-10) : rawPhone;
 
   let tenantUser = null;
-  if (tenantId) {
-    tenantUser = await User.findById(tenantId);
-  } else if (cleanedPhone) {
+  const mongoose = require("mongoose");
+  if (tenantId && mongoose.Types.ObjectId.isValid(tenantId)) {
+    try {
+      tenantUser = await User.findById(tenantId);
+    } catch (e) {
+      console.warn("Tenant findById error:", e);
+    }
+  }
+  if (!tenantUser && cleanedPhone) {
     tenantUser = await User.findOne({ phone: { $regex: cleanedPhone + "$" } });
+    if (!tenantUser && tenantName) {
+      try {
+        tenantUser = await User.create({
+          name: tenantName.trim(),
+          phone: cleanedPhone,
+          email: tenantEmail?.trim() || undefined,
+          role: "tenant",
+          isVerified: true,
+          isActive: true,
+        });
+      } catch (createErr) {
+        console.warn("Auto-create tenant user warning:", createErr.message);
+      }
+    }
   }
 
-  const linkedTenantId = tenantUser?._id || (tenantId ? tenantId : undefined);
+  const linkedTenantId = tenantUser?._id || (tenantId && mongoose.Types.ObjectId.isValid(tenantId) ? tenantId : undefined);
   const linkedTenantName = tenantUser?.name || tenantName?.trim() || "Direct Tenant";
   const linkedTenantPhone = tenantUser?.phone || cleanedPhone;
   const linkedTenantEmail = tenantUser?.email || tenantEmail?.trim() || undefined;
+
+  // ── ENFORCE ONE PROPERTY PER TENANT RULE ──────────────────────────────────────
+  // Check if tenant already has an active property assigned to them
+  const tenantCheckOr = [];
+  if (linkedTenantId && mongoose.Types.ObjectId.isValid(linkedTenantId)) {
+    tenantCheckOr.push({ "deal.tenantId": linkedTenantId });
+  }
+  if (linkedTenantPhone) {
+    const rawClean = String(linkedTenantPhone).replace(/\D/g, "").slice(-10);
+    if (rawClean) {
+      tenantCheckOr.push({ "deal.tenantPhone": { $regex: rawClean + "$" } });
+      tenantCheckOr.push({ "deal.tenantPhone": linkedTenantPhone });
+    }
+  }
+
+  if (tenantCheckOr.length > 0) {
+    const existingActiveProperty = await PropertyLead.findOne({
+      _id: { $ne: lead._id },
+      isDeleted: false,
+      $and: [
+        {
+          $or: [
+            { "deal.isClosed": true },
+            { status: { $in: ["rented", "sold"] } },
+          ],
+        },
+        { $or: tenantCheckOr },
+      ],
+    });
+
+    if (existingActiveProperty) {
+      const activeTitle =
+        existingActiveProperty.title ||
+        `${existingActiveProperty.propertyType || "Property"} in ${existingActiveProperty.locality || "Delhi NCR"}`;
+      throw new ApiError(
+        400,
+        `Tenant "${linkedTenantName}" (Phone: ${linkedTenantPhone}) is already assigned to active property: "${activeTitle}". A tenant can only take ONE property at a time. Please vacate the tenant from the existing property first.`
+      );
+    }
+  }
 
   const price = Number(finalPrice) || lead.expectedPrice;
   const newStatus = dealType.toLowerCase() === "sale" ? "sold" : "rented";
@@ -1240,9 +1306,47 @@ const confirmDeal = async (req, res) => {
 
   await lead.save();
 
+  // ⚡ Credit Field Agent Commission Wallet
+  const agentRecipient = lead.agent || lead.createdBy;
+  if (agentRecipient && firstMonthCommission > 0) {
+    try {
+      await User.findByIdAndUpdate(agentRecipient, {
+        $inc: { 'commissionWallet.balance': firstMonthCommission },
+      });
+    } catch (err) {
+      console.error("Agent wallet update error in confirmDeal:", err);
+    }
+  }
+
+  // ⚡ Sync Initial Rent Record to unified RentPayment collection
+  if (linkedTenantId && mongoose.Types.ObjectId.isValid(linkedTenantId)) {
+    try {
+      await RentPayment.findOneAndUpdate(
+        { tenantId: linkedTenantId, propertyId: lead._id, month: currentMonthStr },
+        {
+          tenantId: linkedTenantId,
+          propertyId: lead._id,
+          month: currentMonthStr,
+          year: new Date().getFullYear(),
+          amount: price,
+          paidAmount: price,
+          dueDate: new Date(),
+          paidDate: new Date(),
+          status: 'paid',
+          paymentMethod: 'upi',
+          transactionId: `TXN-${Date.now().toString().slice(-8)}`,
+          notes: '1st Month Rent & Tenancy Confirmation Payment',
+          createdBy: req.user._id,
+        },
+        { upsert: true, new: true }
+      );
+    } catch (rpErr) {
+      console.error("RentPayment upsert error in confirmDeal:", rpErr);
+    }
+  }
+
   // ⚡ Notify Field Agent about Tenant Registration & Earned Commission
   try {
-    const agentRecipient = lead.agent || lead.createdBy;
     if (agentRecipient) {
       const propertyTitle = lead.title || lead.locality || lead.propertyDetails?.address?.city || lead.leadId || "Property";
       const notifMsg = isSale
@@ -1301,6 +1405,7 @@ const confirmDeal = async (req, res) => {
 /**
  * DELETE /api/v1/leads/:id/deal/tenant (or DELETE /api/v1/leads/:id/deal)
  * @desc SUPER ADMIN: Remove tenant from closed deal, vacate unit and reopen property to verified status
+ * NOTE: Financial records (rent ledger, agent commission, owner payouts, RentPayment records) are permanently preserved and NEVER deleted.
  */
 const removeTenantFromDeal = async (req, res) => {
   const { id } = req.params;
@@ -1310,7 +1415,30 @@ const removeTenantFromDeal = async (req, res) => {
   const formerTenantId = lead.deal?.tenantId;
   const formerTenantName = lead.deal?.tenantName;
 
-  // Reset deal and status
+  // 1. Archive active tenancy permanently into tenancyHistory before clearing active pointer
+  if (lead.deal && (lead.deal.tenantId || lead.deal.tenantName || lead.deal.isClosed)) {
+    if (!Array.isArray(lead.tenancyHistory)) {
+      lead.tenancyHistory = [];
+    }
+    lead.tenancyHistory.push({
+      tenantId: lead.deal.tenantId,
+      tenantName: lead.deal.tenantName,
+      tenantPhone: lead.deal.tenantPhone,
+      tenantEmail: lead.deal.tenantEmail,
+      tenantAadhaarLast4: lead.deal.tenantAadhaarLast4,
+      dealType: lead.deal.dealType || 'rent',
+      finalPrice: lead.deal.finalPrice,
+      deposit: lead.deal.deposit,
+      leaseStartDate: lead.deal.leaseStartDate,
+      leaseEndDate: new Date(),
+      agreementNumber: lead.deal.agreementNumber,
+      vacatedAt: new Date(),
+      vacatedBy: req.user?._id,
+      vacatedReason: req.body?.reason || 'Tenant removed and unit vacated by Super Admin',
+    });
+  }
+
+  // 2. Reset deal and status (Financial ledgers, commissions, owner payouts remain 100% intact)
   lead.status = "verified";
   lead.deal = {
     isClosed: false,
@@ -1363,7 +1491,7 @@ const removeTenantFromDeal = async (req, res) => {
     new ApiResponse(
       200,
       lead,
-      "Tenant successfully removed. Property is now vacant and restored to 'VERIFIED' status."
+      "Tenant successfully removed. Tenancy history and financial audit records permanently archived. Property is now vacant and restored to 'VERIFIED' status."
     )
   );
 };
@@ -2229,12 +2357,13 @@ const createComplaintTicket = async (req, res) => {
 };
 
 /**
+/**
  * PATCH /api/v1/leads/:propertyId/complaints/:ticketId
- * @desc Update complaint status and add resolution remarks
+ * @desc Update complaint status, assign staff, and add resolution remarks
  */
 const updateComplaintStatus = async (req, res) => {
   const { propertyId, ticketId } = req.params;
-  const { status = 'resolved', resolutionNotes } = req.body;
+  const { status, resolutionNotes, assignedStaff, assignedStaffName } = req.body;
 
   const lead = await PropertyLead.findOne({ _id: propertyId, isDeleted: false });
   if (!lead) throw new ApiError(404, 'Property not found');
@@ -2246,13 +2375,101 @@ const updateComplaintStatus = async (req, res) => {
 
   if (status) ticket.status = status;
   if (resolutionNotes) ticket.resolutionNotes = resolutionNotes;
+  if (assignedStaff) {
+    ticket.assignedStaff = assignedStaff;
+    if (assignedStaffName) ticket.assignedStaffName = assignedStaffName;
+  }
   if (status === 'resolved' || status === 'closed') ticket.resolvedAt = new Date();
 
   await lead.save();
-  return res.json(new ApiResponse(200, ticket, `Complaint ticket updated to '${status}'`));
+  return res.json(new ApiResponse(200, ticket, `Complaint ticket updated successfully`));
 };
 
+/**
+ * POST /api/v1/leads/:id/inspections/schedule
+ * @desc Schedule and assign property inspection to staff
+ */
+const schedulePropertyInspection = async (req, res) => {
+  const { id } = req.params;
+  const { inspectorId, inspectorName, scheduledDate, notes, conditionScore } = req.body;
 
+  const lead = await PropertyLead.findOne({ _id: id, isDeleted: false });
+  if (!lead) throw new ApiError(404, 'Property lead not found');
+
+  let inspectorObjId = null;
+  let inspectorDisplayName = inspectorName || 'Field Staff';
+
+  if (inspectorId) {
+    const inspectorUser = await User.findById(inspectorId);
+    if (inspectorUser) {
+      inspectorObjId = inspectorUser._id;
+      inspectorDisplayName = inspectorUser.name || inspectorDisplayName;
+    }
+  }
+
+  if (!lead.scheduledInspections) lead.scheduledInspections = [];
+
+  const newInspection = {
+    inspectionId: `INSP-${Date.now().toString().slice(-6)}`,
+    scheduledDate: scheduledDate ? new Date(scheduledDate) : new Date(),
+    status: 'scheduled',
+    inspector: inspectorObjId,
+    inspectorName: inspectorDisplayName,
+    conditionScore: conditionScore || 'good',
+    notes: notes || 'Inspection scheduled by Super Admin.',
+  };
+
+  lead.scheduledInspections.unshift(newInspection);
+  await lead.save();
+
+  if (inspectorObjId) {
+    try {
+      await createAndSendNotification({
+        recipient: inspectorObjId,
+        recipientRole: 'field_staff',
+        sender: req.user._id,
+        senderName: req.user.name,
+        title: 'New Property Inspection Assigned 📋',
+        message: `You have been assigned to inspect "${lead.title || lead.locality}" scheduled for ${new Date(newInspection.scheduledDate).toLocaleDateString('en-IN')}.`,
+        type: 'inspection_scheduled',
+        priority: 'high',
+        leadId: lead._id,
+        propertyId: lead.propertyId || lead.leadId,
+        data: { lead, inspection: newInspection },
+      });
+    } catch (e) {
+      console.error('Notification error on inspection schedule:', e);
+    }
+  }
+
+  return res.json(new ApiResponse(200, newInspection, 'Inspection scheduled successfully'));
+};
+
+/**
+ * PATCH /api/v1/leads/:propertyId/room-change/:requestId
+ * @desc Update room change request status & remarks
+ */
+const updateRoomChangeRequestStatus = async (req, res) => {
+  const { propertyId, requestId } = req.params;
+  const { status, adminRemarks } = req.body;
+
+  const lead = await PropertyLead.findOne({ _id: propertyId, isDeleted: false });
+  if (!lead) throw new ApiError(404, 'Property not found');
+
+  const request = (lead.roomChangeRequests || []).find(
+    (r) => r.requestId === requestId || r._id?.toString() === requestId
+  );
+  if (!request) throw new ApiError(404, 'Room change request not found');
+
+  if (status) request.status = status;
+  if (adminRemarks) request.adminRemarks = adminRemarks;
+  request.resolvedBy = req.user._id;
+  request.resolvedAt = new Date();
+  request.updatedAt = new Date();
+
+  await lead.save();
+  return res.json(new ApiResponse(200, request, `Room change request updated to '${status}'`));
+};
 
 /**
  * POST /api/v1/leads/upload-media
@@ -2291,9 +2508,11 @@ module.exports = {
   publishInspectionLead,
   getStaffInspections,
   addInspectionReport,
+  schedulePropertyInspection,
   getStaffComplaints,
   createComplaintTicket,
   updateComplaintStatus,
+  updateRoomChangeRequestStatus,
 
   // Field Agent Methods
   createPropertyLead,
