@@ -22,8 +22,9 @@ const activityRoutes = require('./activity.routes');
 const searchRoutes = require('./search.routes');
 const accessRoutes = require('./access.routes');
 
-// ── 1. Public Shared Catalogues (No Auth Required for prospective clients) ────
+// ── 1. Public Shared Catalogues & Webhooks (No Auth Required) ────────────────
 router.use('/shared', sharedRoutes);
+router.use('/webhooks', require('./webhook.routes'));
 
 // ── 2. TV Display Screen (Public or screen-token accessible) ───────────────
 router.get('/showcase/:showcaseId/display', require('./showcase.routes'));

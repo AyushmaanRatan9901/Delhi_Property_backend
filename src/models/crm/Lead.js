@@ -149,7 +149,10 @@ const leadSchema = new mongoose.Schema(
 
 // Compound indexes for fast searching and filtering
 leadSchema.index({ name: 'text', phone: 'text', leadId: 'text' });
-leadSchema.index({ assignedTo: 1, status: 1 });
+leadSchema.index({ assignedTo: 1, status: 1, createdAt: -1 });
+leadSchema.index({ assignedTo: 1, nextFollowUpAt: 1 });
+leadSchema.index({ source: 1, createdAt: -1 });
 leadSchema.index({ status: 1, createdAt: -1 });
+leadSchema.index({ archived: 1, createdAt: -1 });
 
 module.exports = mongoose.model('CRMLead', leadSchema);

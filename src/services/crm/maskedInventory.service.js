@@ -39,6 +39,7 @@ const maskPropertyForTeleCaller = (propertyDoc) => {
   return {
     _id: prop._id,
     propertyId: prop.leadId || prop._id?.toString(),
+    maskedPropertyId: prop.leadId || prop._id?.toString(),
     title: prop.title || `${prop.propertyType || 'Property'} in ${prop.locality || 'Delhi NCR'}`,
     description: prop.description || '',
     propertyType: prop.propertyType || 'apartment',
@@ -53,6 +54,7 @@ const maskPropertyForTeleCaller = (propertyDoc) => {
     floor: prop.floorNumber || prop.floor || 0,
     totalFloors: prop.totalFloors || 0,
     price: prop.expectedPrice || prop.rent?.amount || 0,
+    expectedPrice: prop.expectedPrice || prop.rent?.amount || 0,
     priceType: (prop.listingType || 'rent').toLowerCase() === 'sale' ? 'total' : 'monthly',
     deposit: prop.securityDeposit || prop.deposit || 0,
     maintenanceCharge: prop.maintenanceCharge || 0,

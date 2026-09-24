@@ -58,14 +58,32 @@ const callSchema = new mongoose.Schema(
       type: String,
       trim: true,
     },
+    direction: {
+      type: String,
+      enum: ['inbound', 'outbound'],
+      default: 'outbound',
+    },
+    provider: {
+      type: String,
+      default: 'manual',
+    },
+    providerCallId: {
+      type: String,
+      index: true,
+      sparse: true,
+    },
     recording: {
       url: String,
       duration: Number,
       storageProvider: { type: String, default: 'cloud' },
       fileSize: Number,
       mimeType: String,
+      status: { type: String, enum: ['available', 'processing', 'failed', 'none'], default: 'none' },
+      consent: { type: Boolean, default: true },
       uploadedAt: Date,
     },
+    transcript: String,
+    aiSummary: mongoose.Schema.Types.Mixed,
     summary: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'CRMCallSummary',
@@ -80,5 +98,7 @@ const callSchema = new mongoose.Schema(
 
 callSchema.index({ lead: 1, createdAt: -1 });
 callSchema.index({ teleCaller: 1, startedAt: -1 });
+callSchema.index({ teleCaller: 1, createdAt: -1 });
+callSchema.index({ outcome: 1, createdAt: -1 });
 
 module.exports = mongoose.model('CRMCall', callSchema);

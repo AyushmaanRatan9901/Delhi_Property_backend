@@ -15,16 +15,17 @@ const { maskPropertyForTeleCaller } = require('./maskedInventory.service');
  */
 
 const calculateMatchScore = (property, requirement) => {
-  if (!property || !requirement) return { matchScore: 0, matchedCriteria: [] };
+  if (!property || !requirement) return { score: 0, matchScore: 0, matchedCriteria: [] };
 
   let score = 0;
   const matchedCriteria = [];
 
   // 1. Listing Type Match (30 pts)
   const propListingType = (property.listingType || 'rent').toLowerCase();
-  const reqListingType = (requirement.requirementType || 'rent').toLowerCase();
+  const reqListingType = (requirement.requirementType || requirement.purpose || 'rent').toLowerCase();
   if (propListingType === reqListingType) {
     score += 30;
+    matchedCriteria.push('purpose');
     matchedCriteria.push('listing_type');
   }
 
@@ -37,8 +38,14 @@ const calculateMatchScore = (property, requirement) => {
     else if (property.propertyType.includes('4BHK') || property.propertyType.includes('4 BHK')) propBhk = 4;
   }
 
-  if (Array.isArray(requirement.bhk) && requirement.bhk.length > 0) {
-    if (requirement.bhk.includes(propBhk)) {
+  const reqBhkList = Array.isArray(requirement.bhk)
+    ? requirement.bhk
+    : requirement.bhk
+    ? [Number(requirement.bhk)]
+    : [];
+
+  if (reqBhkList.length > 0) {
+    if (reqBhkList.includes(propBhk)) {
       score += 25;
       matchedCriteria.push('bhk');
     }
@@ -49,7 +56,10 @@ const calculateMatchScore = (property, requirement) => {
 
   // 3. Locality Match (25 pts)
   const propLocality = (property.locality || '').toLowerCase().trim();
-  const reqLocalities = (requirement.localities || []).map((l) => l.toLowerCase().trim());
+  const rawLocalities = requirement.preferredLocalities || requirement.localities || [];
+  const reqLocalities = (Array.isArray(rawLocalities) ? rawLocalities : [rawLocalities]).map((l) =>
+    l.toLowerCase().trim()
+  );
 
   if (reqLocalities.length > 0) {
     const isLocalityMatch = reqLocalities.some(
@@ -65,8 +75,8 @@ const calculateMatchScore = (property, requirement) => {
 
   // 4. Budget Match (20 pts)
   const price = property.expectedPrice || property.rent?.amount || 0;
-  const minBudget = requirement.budgetMin || 0;
-  const maxBudget = requirement.budgetMax || 0;
+  const minBudget = requirement.budget?.min ?? requirement.budgetMin ?? 0;
+  const maxBudget = requirement.budget?.max ?? requirement.budgetMax ?? 0;
 
   if (maxBudget > 0) {
     if (price >= minBudget && price <= maxBudget) {
@@ -92,6 +102,7 @@ const calculateMatchScore = (property, requirement) => {
   const finalScore = Math.min(Math.round(score), 100);
 
   return {
+    score: finalScore,
     matchScore: finalScore,
     matchedCriteria,
   };

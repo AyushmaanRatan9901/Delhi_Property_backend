@@ -7,6 +7,7 @@ const SITE_VISIT_STATUSES = [
   'client_reached',
   'in_progress',
   'completed',
+  'visit_completed',
   'cancelled',
   'no_show',
 ];
@@ -88,5 +89,7 @@ const siteVisitSchema = new mongoose.Schema(
 
 siteVisitSchema.index({ lead: 1, scheduledAt: -1 });
 siteVisitSchema.index({ assignedFieldAgent: 1, scheduledAt: -1 });
+siteVisitSchema.index({ scheduledAt: 1, status: 1 });
+siteVisitSchema.index({ property: 1, scheduledAt: 1 });
 
 module.exports = mongoose.model('CRMSiteVisit', siteVisitSchema);

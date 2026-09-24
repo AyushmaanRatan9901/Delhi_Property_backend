@@ -54,7 +54,7 @@ const handoffSchema = new mongoose.Schema(
     nextAction: String,
     status: {
       type: String,
-      enum: ['pending', 'accepted', 'returned', 'cancelled'],
+      enum: ['pending', 'accepted', 'rejected', 'returned', 'completed', 'cancelled'],
       default: 'pending',
       index: true,
     },
@@ -69,5 +69,6 @@ const handoffSchema = new mongoose.Schema(
 );
 
 handoffSchema.index({ status: 1, createdAt: -1 });
+handoffSchema.index({ teleCaller: 1, createdAt: -1 });
 
 module.exports = mongoose.model('CRMHandoff', handoffSchema);
