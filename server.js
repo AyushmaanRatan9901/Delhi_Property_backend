@@ -23,8 +23,8 @@ const start = async () => {
       `\n🚀 Rent Management Server (with Socket.io) is running in ${process.env.NODE_ENV || "development"} mode!`,
     );
     console.log(`📡 Local:   http://localhost:${PORT}`);
-    console.log(`🌐 Network: http://192.168.1.12:${PORT}`);
-    console.log(`🔗 API V1:  http://192.168.1.12:${PORT}/api/v1\n`);
+    console.log(`🌐 Network: http://192.168.1.22:${PORT}`);
+    console.log(`🔗 API V1:  http://192.168.1.22:${PORT}/api/v1\n`);
   });
 };
 
